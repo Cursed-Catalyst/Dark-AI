@@ -1,291 +1,369 @@
 """
-agent.py — Core AI Agent
-Handles Claude API calls, shell execution, memory, and root escalation logic.
-Compatible with Python 3.8+
+DarkAI - Core Agent
+Handles all AI logic, shell execution, and memory
 """
 
 import os
+import sys
+import json
 import subprocess
 import sqlite3
-import json
-import re
-import sys
-from datetime import datetime
+import datetime
+import platform
 from pathlib import Path
 
-# ── Anthropic client (lazy import so we can show helpful error) ────────────
-try:
-    import anthropic
-    _ANTHROPIC_OK = True
-except ImportError:
-    _ANTHROPIC_OK = False
+# ── Dependency auto-installer ──────────────────────────────
+def ensure_deps():
+    required = {
+        "anthropic": "anthropic",
+        "flask": "flask",
+        "flask_socketio": "flask-socketio",
+        "groq": "groq",
+        "openai": "openai",
+        "google.generativeai": "google-generativeai",
+    }
+    for mod, pkg in required.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            print(f"  [*] Installing {pkg}...")
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
 
-DB_PATH = Path(__file__).parent / "memory.db"
-SYSTEM_PROMPT = """You are KaliAI — a powerful, expert AI assistant running directly on a Kali Linux machine.
+ensure_deps()
 
-You have full access to the Linux shell and can execute any command the user requests.
+# ── Config ─────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DB_PATH  = BASE_DIR / "memory.db"
+ENV_PATH = BASE_DIR / ".env"
+
+def load_env():
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+load_env()
+
+# ── Memory (SQLite) ────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            role    TEXT NOT NULL,
+            content TEXT NOT NULL,
+            ts      TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_message(role: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO messages (role, content, ts) VALUES (?,?,?)",
+                 (role, content, datetime.datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_history(limit: int = 20):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT role, content FROM messages ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+def clear_history():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM messages")
+    conn.commit()
+    conn.close()
+
+def get_setting(key):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+    conn.commit()
+    conn.close()
+
+# ── Provider definitions ───────────────────────────────────
+PROVIDERS = {
+    "1": {
+        "name": "Anthropic (Claude)",
+        "models": ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
+        "default_model": "claude-sonnet-4-5",
+        "env_key": "ANTHROPIC_API_KEY",
+        "url": "console.anthropic.com",
+        "paid": True
+    },
+    "2": {
+        "name": "Groq (Free)",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+        "default_model": "llama-3.3-70b-versatile",
+        "env_key": "GROQ_API_KEY",
+        "url": "console.groq.com",
+        "paid": False
+    },
+    "3": {
+        "name": "OpenAI (GPT)",
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
+        "default_model": "gpt-4o-mini",
+        "env_key": "OPENAI_API_KEY",
+        "url": "platform.openai.com",
+        "paid": True
+    },
+    "4": {
+        "name": "Google (Gemini)",
+        "models": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro"],
+        "default_model": "gemini-1.5-flash",
+        "env_key": "GOOGLE_API_KEY",
+        "url": "aistudio.google.com",
+        "paid": False
+    },
+    "5": {
+        "name": "Mistral AI",
+        "models": ["mistral-large-latest", "mistral-small-latest", "open-mistral-7b"],
+        "default_model": "mistral-small-latest",
+        "env_key": "MISTRAL_API_KEY",
+        "url": "console.mistral.ai",
+        "paid": True
+    },
+    "6": {
+        "name": "Cohere",
+        "models": ["command-r-plus", "command-r", "command"],
+        "default_model": "command-r",
+        "env_key": "COHERE_API_KEY",
+        "url": "dashboard.cohere.com",
+        "paid": False
+    },
+    "7": {
+        "name": "Ollama (Local/Free)",
+        "models": ["llama3", "mistral", "codellama", "phi3"],
+        "default_model": "llama3",
+        "env_key": None,
+        "url": "ollama.ai",
+        "paid": False
+    },
+}
+
+# ── Shell execution ────────────────────────────────────────
+def run_shell(command: str, use_sudo: bool = False) -> dict:
+    if use_sudo and not command.strip().startswith("sudo"):
+        command = f"sudo {command}"
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=60
+        )
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+            "command": command
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Command timed out after 60s", "returncode": -1, "command": command}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "returncode": -1, "command": command}
+
+def needs_root(command: str) -> bool:
+    root_keywords = [
+        "apt ", "apt-get ", "dpkg ", "systemctl ", "service ",
+        "iptables", "ip6tables", "mount ", "umount ", "fdisk",
+        "chmod 777", "chown root", "/etc/shadow", "/etc/passwd",
+        "passwd ", "adduser", "useradd", "userdel", "visudo",
+        "insmod", "rmmod", "modprobe", "ifconfig ", "route add",
+        "nmap -sS", "nmap -O", "airmon", "airodump", "aireplay"
+    ]
+    return any(kw in command for kw in root_keywords)
+
+# ── System prompt ──────────────────────────────────────────
+SYSTEM_PROMPT = """You are DarkAI, a powerful AI assistant running directly on Kali Linux.
+
+You have full access to the Linux system and can execute shell commands.
 You are an expert in:
-- Ethical hacking and penetration testing (nmap, metasploit, hashcat, hydra, sqlmap, gobuster, nikto, etc.)
+- Ethical hacking and penetration testing
 - Linux system administration
-- Programming (Python, Bash, Ruby, C, etc.)
-- Networking and security
-- CTF challenges and vulnerability research
-- General knowledge and conversation
+- Programming (Python, Bash, and more)
+- Cybersecurity tools (nmap, metasploit, hashcat, hydra, burpsuite, etc.)
+- General knowledge and problem solving
 
-SHELL EXECUTION:
-When you need to run a command, output it in this exact format:
-<execute>command here</execute>
+## How to execute commands:
+When you need to run a command, use this EXACT format:
+<EXEC>command here</EXEC>
 
-You can chain multiple commands:
-<execute>nmap -sV 192.168.1.1</execute>
-
-ROOT ESCALATION:
-If a task requires root and the user hasn't confirmed, output:
-<need_root>reason why root is needed</need_root>
-
-RULES:
-- Always explain what you're doing and why
-- After running a command, explain the output
-- For hacking tasks, always confirm the target is owned by the user or they have permission
-- Be conversational and helpful for general questions
-- If unsure about something, say so
-- Never run destructive commands without explicit user confirmation
-
-You are running on: Kali Linux
-Current user: {username}
-Root available: {root_available}
+## Rules:
+1. Always explain what you're doing and why
+2. If a command needs root/sudo, say so BEFORE running it
+3. Never run destructive commands without extreme caution
+4. For hacking tasks, always confirm the target is owned by the user
+5. Be direct, helpful, and educational
+6. You remember previous messages in this conversation
 """
 
-
-class Memory:
-    """Simple SQLite-backed conversation memory."""
-
+# ── AI Core ────────────────────────────────────────────────
+class DarkAI:
     def __init__(self):
-        self.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        self._init_db()
+        self.provider_id = None
+        self.provider = None
+        self.model = None
+        self._load_saved_provider()
 
-    def _init_db(self):
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+    def _load_saved_provider(self):
+        init_db()
+        saved = get_setting("provider_id")
+        if saved and saved in PROVIDERS:
+            self.provider_id = saved
+            self.provider = PROVIDERS[saved]
+            self.model = get_setting("model") or self.provider["default_model"]
+
+    def set_provider(self, provider_id: str, model: str = None):
+        self.provider_id = provider_id
+        self.provider = PROVIDERS[provider_id]
+        self.model = model or self.provider["default_model"]
+        set_setting("provider_id", provider_id)
+        set_setting("model", self.model)
+
+    def get_api_key(self):
+        if not self.provider:
+            return None
+        env_key = self.provider.get("env_key")
+        if not env_key:
+            return "ollama"
+        return os.environ.get(env_key)
+
+    def call_llm(self, messages: list) -> str:
+        pid = self.provider_id
+        key = self.get_api_key()
+        model = self.model
+
+        if pid == "1":  # Anthropic
+            import anthropic as ac
+            client = ac.Anthropic(api_key=key)
+            system = next((m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT)
+            msgs = [m for m in messages if m["role"] != "system"]
+            response = client.messages.create(
+                model=model, max_tokens=4096, system=system, messages=msgs
             )
-        """)
-        self.conn.commit()
+            return response.content[0].text
 
-    def add(self, role: str, content: str):
-        self.conn.execute(
-            "INSERT INTO messages (role, content, timestamp) VALUES (?, ?, ?)",
-            (role, content, datetime.now().isoformat())
-        )
-        self.conn.commit()
+        elif pid == "2":  # Groq
+            from groq import Groq
+            client = Groq(api_key=key)
+            response = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=4096
+            )
+            return response.choices[0].message.content
 
-    def get_recent(self, limit: int = 20) -> list:
-        cursor = self.conn.execute(
-            "SELECT role, content FROM messages ORDER BY id DESC LIMIT ?",
-            (limit,)
-        )
-        rows = cursor.fetchall()
-        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        elif pid == "3":  # OpenAI
+            from openai import OpenAI
+            client = OpenAI(api_key=key)
+            response = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=4096
+            )
+            return response.choices[0].message.content
 
-    def clear(self):
-        self.conn.execute("DELETE FROM messages")
-        self.conn.commit()
+        elif pid == "4":  # Google
+            import google.generativeai as genai
+            genai.configure(api_key=key)
+            gmodel = genai.GenerativeModel(model)
+            history = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+            response = gmodel.generate_content(history)
+            return response.text
 
+        elif pid == "5":  # Mistral
+            from openai import OpenAI
+            client = OpenAI(api_key=key, base_url="https://api.mistral.ai/v1")
+            response = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=4096
+            )
+            return response.choices[0].message.content
 
-class ShellExecutor:
-    """Executes shell commands safely with sudo support."""
+        elif pid == "6":  # Cohere
+            import cohere
+            client = cohere.Client(api_key=key)
+            chat_history = [{"role": m["role"].upper(), "message": m["content"]} for m in messages[:-1]]
+            last = messages[-1]["content"]
+            response = client.chat(message=last, chat_history=chat_history, model=model)
+            return response.text
 
-    def __init__(self):
-        self.use_root = False
-        self.username = os.environ.get("USER", os.environ.get("LOGNAME", "kali"))
+        elif pid == "7":  # Ollama
+            import requests
+            response = requests.post("http://localhost:11434/api/chat", json={
+                "model": model,
+                "messages": messages,
+                "stream": False
+            })
+            return response.json()["message"]["content"]
 
-    def run(self, command: str, force_root: bool = False) -> dict:
-        """Run a shell command, return stdout/stderr/returncode."""
+        raise ValueError(f"Unknown provider: {pid}")
+
+    def process_response(self, text: str, confirm_root: bool = False) -> dict:
+        import re
+        pattern = re.compile(r'<EXEC>(.*?)</EXEC>', re.DOTALL)
+        matches = list(pattern.finditer(text))
+        exec_results = []
+
+        if not matches:
+            return {"text": text, "exec_results": [], "needs_root_confirm": False, "root_command": None}
+
+        for match in matches:
+            command = match.group(1).strip()
+            if needs_root(command) and not confirm_root:
+                return {
+                    "text": text.replace(f"<EXEC>{command}</EXEC>", f"[Command ready: `{command}`]"),
+                    "exec_results": exec_results,
+                    "needs_root_confirm": True,
+                    "root_command": command
+                }
+            result = run_shell(command, use_sudo=needs_root(command))
+            exec_results.append(result)
+            output = result["stdout"] or result["stderr"] or "(no output)"
+            text = text.replace(
+                f"<EXEC>{command}</EXEC>",
+                f"\n```\n$ {command}\n{output.strip()}\n```\n"
+            )
+
+        return {"text": text, "exec_results": exec_results, "needs_root_confirm": False, "root_command": None}
+
+    def chat(self, user_message: str, confirm_root: bool = False) -> dict:
         try:
-            if force_root or self.use_root:
-                if not command.strip().startswith("sudo"):
-                    command = f"sudo {command}"
+            if not self.provider:
+                return {"success": False, "response": "⚠️ No provider selected. Please restart and choose a provider."}
 
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                executable="/bin/bash"
-            )
+            api_key = self.get_api_key()
+            if not api_key and self.provider_id != "7":
+                return {"success": False, "response": f"⚠️ No API key found for {self.provider['name']}. Add it to .env"}
+
+            save_message("user", user_message)
+            history = get_history(20)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
+            ai_text = self.call_llm(messages)
+            result = self.process_response(ai_text, confirm_root=confirm_root)
+            save_message("assistant", result["text"])
+
             return {
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip(),
-                "returncode": result.returncode,
-                "command": command,
-                "success": result.returncode == 0
+                "success": True,
+                "response": result["text"],
+                "exec_results": result["exec_results"],
+                "needs_root_confirm": result["needs_root_confirm"],
+                "root_command": result["root_command"]
             }
-        except subprocess.TimeoutExpired:
-            return {
-                "stdout": "",
-                "stderr": "Command timed out after 60 seconds.",
-                "returncode": -1,
-                "command": command,
-                "success": False
-            }
+
         except Exception as e:
-            return {
-                "stdout": "",
-                "stderr": str(e),
-                "returncode": -1,
-                "command": command,
-                "success": False
-            }
+            return {"success": False, "error": str(e), "response": f"⚠️ Error: {str(e)}"}
 
-    def check_sudo(self) -> bool:
-        """Check if sudo is available without password."""
-        result = subprocess.run(
-            ["sudo", "-n", "true"],
-            capture_output=True,
-            timeout=5
-        )
-        return result.returncode == 0
-
-
-class KaliAI:
-    """Main AI agent — orchestrates Claude, shell, and memory."""
-
-    def __init__(self, api_key: str):
-        if not _ANTHROPIC_OK:
-            raise RuntimeError("anthropic package not installed. Run: pip install anthropic")
-
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.memory = Memory()
-        self.shell = ShellExecutor()
-        self.pending_root_request = None  # stores reason when root is needed
-
-    def _build_system(self) -> str:
-        return SYSTEM_PROMPT.format(
-            username=self.shell.username,
-            root_available=self.shell.check_sudo()
-        )
-
-    def _parse_response(self, text: str) -> dict:
-        """Parse Claude's response for execute/need_root tags."""
-        commands = re.findall(r'<execute>(.*?)</execute>', text, re.DOTALL)
-        root_needed = re.findall(r'<need_root>(.*?)</need_root>', text, re.DOTALL)
-
-        # Clean text for display
-        clean = re.sub(r'<execute>.*?</execute>', '', text, flags=re.DOTALL)
-        clean = re.sub(r'<need_root>.*?</need_root>', '', clean, flags=re.DOTALL)
-        clean = clean.strip()
-
-        return {
-            "text": clean,
-            "commands": [c.strip() for c in commands],
-            "root_needed": root_needed[0].strip() if root_needed else None
-        }
-
-    def _execute_commands(self, commands: list) -> list:
-        """Run a list of shell commands and return results."""
-        results = []
-        for cmd in commands:
-            result = self.shell.run(cmd)
-            results.append(result)
-        return results
-
-    def chat(self, user_input: str, root_confirmed: bool = False) -> dict:
-        """
-        Send a message and get a response.
-        Returns dict with: text, commands, command_results, needs_root, root_reason
-        """
-        # Handle root confirmation
-        if root_confirmed and self.pending_root_request:
-            self.shell.use_root = True
-            self.pending_root_request = None
-
-        # Store user message
-        self.memory.add("user", user_input)
-
-        # Build messages for API
-        messages = self.memory.get_recent(20)
-
-        try:
-            response = self.client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=4096,
-                system=self._build_system(),
-                messages=messages
-            )
-            raw_text = response.content[0].text
-        except Exception as e:
-            return {
-                "text": f"Error communicating with Claude API: {str(e)}",
-                "commands": [],
-                "command_results": [],
-                "needs_root": False,
-                "root_reason": None,
-                "error": True
-            }
-
-        # Parse response
-        parsed = self._parse_response(raw_text)
-
-        # Check if root is needed
-        if parsed["root_needed"] and not self.shell.use_root:
-            self.pending_root_request = parsed["root_needed"]
-            self.memory.add("assistant", raw_text)
-            return {
-                "text": parsed["text"],
-                "commands": [],
-                "command_results": [],
-                "needs_root": True,
-                "root_reason": parsed["root_needed"],
-                "error": False
-            }
-
-        # Execute commands if any
-        command_results = []
-        if parsed["commands"]:
-            command_results = self._execute_commands(parsed["commands"])
-
-            # Feed results back to Claude for explanation
-            if command_results:
-                results_text = "\n".join([
-                    f"$ {r['command']}\n{r['stdout']}" +
-                    (f"\nSTDERR: {r['stderr']}" if r['stderr'] else "") +
-                    (f"\n[Exit code: {r['returncode']}]" if r['returncode'] != 0 else "")
-                    for r in command_results
-                ])
-
-                # Get Claude to explain the output
-                self.memory.add("assistant", raw_text)
-                self.memory.add("user", f"Command output:\n{results_text}\n\nPlease explain the results.")
-
-                try:
-                    explain_response = self.client.messages.create(
-                        model="claude-sonnet-4-5",
-                        max_tokens=2048,
-                        system=self._build_system(),
-                        messages=self.memory.get_recent(20)
-                    )
-                    explanation = explain_response.content[0].text
-                    self.memory.add("assistant", explanation)
-                    parsed["text"] = parsed["text"] + "\n\n" + explanation if parsed["text"] else explanation
-                except Exception:
-                    pass
-        else:
-            self.memory.add("assistant", raw_text)
-
-        return {
-            "text": parsed["text"],
-            "commands": parsed["commands"],
-            "command_results": command_results,
-            "needs_root": False,
-            "root_reason": None,
-            "error": False
-        }
-
-    def clear_memory(self):
-        self.memory.clear()
-        self.shell.use_root = False
-        self.pending_root_request = None
+agent = DarkAI()
